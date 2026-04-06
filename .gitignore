@@ -1,0 +1,9 @@
+node_modules/
+archive/
+.omc/
+.remember/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+coverage/

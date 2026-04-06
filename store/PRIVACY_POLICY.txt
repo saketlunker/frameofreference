@@ -1,0 +1,20 @@
+Frame of Reference - Privacy Policy
+
+Last updated: 2026-04-06
+
+Frame of Reference does not collect, store, or transmit any user data.
+
+- No analytics or tracking of any kind.
+- No network requests are made by this extension.
+- All processing occurs locally in the browser.
+- Clipboard data is generated entirely on-device and is never sent externally.
+- No cookies, local storage, or remote databases are used.
+
+The extension requires the following permissions solely for its core functionality:
+
+- activeTab: To access the content of the currently active tab when the user
+  activates the picker. Only used on the tab the user explicitly clicks.
+- clipboardWrite: To copy the generated element reference to the clipboard.
+- scripting: To inject the picker script into the active tab.
+
+No data leaves your browser at any point during the use of this extension.

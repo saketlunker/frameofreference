@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Frame of Reference",
+  "homepage_url": "https://github.com/saketlunker/frameofreference",
+  "description": "Pick a page element and copy compact, exact, LLM-ready context for precise UI edits.",
+  "version": "1.0.0",
+  "permissions": ["activeTab", "clipboardWrite", "scripting"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+F"
+      },
+      "description": "Toggle Frame of Reference picker"
+    }
+  },
+  "action": {
+    "default_title": "Frame of Reference: click to pick an element",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  }
+}
