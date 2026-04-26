@@ -15,6 +15,10 @@ const MESSAGE_TYPE_RESULT = 'frameofreference:result';
 const MESSAGE_TYPE_CAPTURE = 'frameofreference:capture';
 const RESULT_KINDS = new Set(['copied', 'cancelled', 'error']);
 const SUPPORTED_PROTOCOL_PREFIXES = ['http://', 'https://'];
+const CAPTURE_RESPONSE_TIMEOUT_MS = 5000;
+const BADGE_CLEAR_ALARM_PREFIX = 'frameofreference-clear-badge:';
+const BADGE_CLEAR_ALARM_SEPARATOR = ':';
+const BADGE_CLEAR_ALARM_GRACE_MS = 5000;
 
 // Tracks tabs that already have the picker script injected to avoid redundant
 // evaluation. These sets are intentionally ephemeral — a service worker restart
@@ -28,21 +32,23 @@ const injectedTabs = new Set();
 // finally block won't run for that tab, but the next click will work normally
 // since the set starts empty.
 const processingTabs = new Set();
+const badgeClearTimers = new Map();
+const badgeClearAlarms = new Map();
+const badgeGenerations = new Map();
 
 chrome.action.onClicked.addListener(async (tab) => {
-  if (!tab.id || processingTabs.has(tab.id)) {
+  if (typeof tab.id !== 'number' || processingTabs.has(tab.id)) {
     return;
   }
 
   processingTabs.add(tab.id);
 
   try {
-    // Clear any stale badge from a previous flashBadge whose setTimeout may not
-    // have fired (MV3 service worker can go idle before the timer elapses).
+    // Clear any stale badge from a previous feedback flash before toggling.
     await clearBadge(tab.id);
 
     if (!supportsInjection(tab.url)) {
-      await flashBadge(tab.id, UNSUPPORTED_BADGE_TEXT, ERROR_BADGE_COLOR, 1600);
+      await flashBadge(tab.id, UNSUPPORTED_BADGE_TEXT, ERROR_BADGE_COLOR, 2500);
       return;
     }
 
@@ -69,8 +75,9 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const tabId = sender.tab && sender.tab.id;
-  if (!tabId) {
+  const senderTab = sender.tab;
+  const tabId = senderTab && senderTab.id;
+  if (typeof tabId !== 'number') {
     sendResponse({ ok: false });
     return;
   }
@@ -95,7 +102,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case MESSAGE_TYPE_CAPTURE:
       // Async: capture the visible tab and respond with the data URL.
       // Return true to keep the message channel open for the async response.
-      captureVisibleTabForSender(tabId, sendResponse);
+      captureVisibleTabForSender(senderTab, sendResponse);
       return true;
     default:
       sendResponse({ ok: false });
@@ -105,14 +112,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   injectedTabs.delete(tabId);
-  dispatchBestEffort(clearBadge(tabId));
+  processingTabs.delete(tabId);
+  dispatchBestEffort(cleanupTabState(tabId));
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading' || changeInfo.url) {
     injectedTabs.delete(tabId);
-    dispatchBestEffort(clearBadge(tabId));
+    processingTabs.delete(tabId);
+    dispatchBestEffort(cleanupTabState(tabId));
   }
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  const badgeAlarm = getBadgeAlarmPayload(alarm.name);
+  if (!badgeAlarm || !canClearBadgeGeneration(badgeAlarm.tabId, badgeAlarm.generation, true)) {
+    return;
+  }
+
+  dispatchBestEffort(
+    clearBadgeForGeneration(badgeAlarm.tabId, badgeAlarm.generation, {
+      allowUnknownGeneration: true
+    })
+  );
 });
 
 function supportsInjection(url) {
@@ -136,13 +158,39 @@ function dispatchBestEffort(promise) {
   void promise.catch(noop);
 }
 
-async function captureVisibleTabForSender(_tabId, sendResponse) {
+async function captureVisibleTabForSender(senderTab, sendResponse) {
+  let settled = false;
+  let timeoutId = 0;
+  const respondOnce = (payload) => {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+    clearTimeout(timeoutId);
+    sendResponse(payload);
+  };
+
+  timeoutId = setTimeout(() => {
+    respondOnce({ ok: false, dataUrl: null });
+  }, CAPTURE_RESPONSE_TIMEOUT_MS);
+
   try {
-    const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-    sendResponse({ ok: true, dataUrl });
+    const currentTab = await chrome.tabs.get(senderTab.id);
+    if (
+      !currentTab.active ||
+      currentTab.windowId !== senderTab.windowId ||
+      !supportsInjection(currentTab.url)
+    ) {
+      respondOnce({ ok: false, dataUrl: null });
+      return;
+    }
+
+    const dataUrl = await chrome.tabs.captureVisibleTab(senderTab.windowId, { format: 'png' });
+    respondOnce({ ok: true, dataUrl });
   } catch (error) {
     console.debug('Frame of Reference: captureVisibleTab failed', error);
-    sendResponse({ ok: false, dataUrl: null });
+    respondOnce({ ok: false, dataUrl: null });
   }
 }
 
@@ -222,7 +270,27 @@ async function handleSessionResult(tabId, kind) {
   }
 }
 
+async function cleanupTabState(tabId) {
+  const generation = beginBadgeUpdate(tabId);
+
+  try {
+    await clearBadgeForGeneration(tabId, generation);
+  } finally {
+    if (isBadgeGenerationCurrent(tabId, generation)) {
+      badgeClearTimers.delete(tabId);
+      badgeClearAlarms.delete(tabId);
+      badgeGenerations.delete(tabId);
+    }
+  }
+}
+
 async function updateBadge(tabId) {
+  const generation = beginBadgeUpdate(tabId);
+  await cancelBadgeClear(tabId, { generation });
+  if (!isBadgeGenerationCurrent(tabId, generation)) {
+    return;
+  }
+
   await Promise.all([
     chrome.action.setBadgeBackgroundColor({ tabId, color: ACTIVE_BADGE_COLOR }),
     chrome.action.setBadgeText({ tabId, text: ACTIVE_BADGE_TEXT }),
@@ -231,7 +299,24 @@ async function updateBadge(tabId) {
 }
 
 async function clearBadge(tabId) {
+  const generation = beginBadgeUpdate(tabId);
+  await clearBadgeForGeneration(tabId, generation);
+}
+
+async function clearBadgeForGeneration(tabId, generation, options = {}) {
+  if (!canClearBadgeGeneration(tabId, generation, options.allowUnknownGeneration)) {
+    return;
+  }
+
   try {
+    await cancelBadgeClear(tabId, {
+      generation,
+      allowUnknownGeneration: options.allowUnknownGeneration
+    });
+    if (!canClearBadgeGeneration(tabId, generation, options.allowUnknownGeneration)) {
+      return;
+    }
+
     await Promise.all([
       chrome.action.setBadgeText({ tabId, text: '' }),
       chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE })
@@ -242,18 +327,150 @@ async function clearBadge(tabId) {
 }
 
 async function flashBadge(tabId, text, color, durationMs) {
+  const generation = beginBadgeUpdate(tabId);
+
   try {
+    await cancelBadgeClear(tabId, { generation });
+    if (!isBadgeGenerationCurrent(tabId, generation)) {
+      return;
+    }
+
     await Promise.all([
       chrome.action.setBadgeBackgroundColor({ tabId, color }),
       chrome.action.setBadgeText({ tabId, text })
     ]);
-    // Note: setTimeout in MV3 service workers may not fire if the worker goes
-    // idle before the delay elapses. Badge clearing is best-effort here; using
-    // chrome.alarms would be more reliable but requires an extra permission.
-    setTimeout(() => {
-      dispatchBestEffort(clearBadge(tabId));
-    }, durationMs);
+    if (!isBadgeGenerationCurrent(tabId, generation)) {
+      return;
+    }
+
+    await scheduleBadgeClear(tabId, durationMs, generation);
   } catch (_error) {
     // Best-effort badge flash.
   }
+}
+
+function beginBadgeUpdate(tabId) {
+  const generation = createBadgeGeneration();
+  badgeGenerations.set(tabId, generation);
+  return generation;
+}
+
+function createBadgeGeneration() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function isBadgeGenerationCurrent(tabId, generation) {
+  return badgeGenerations.get(tabId) === generation;
+}
+
+function canClearBadgeGeneration(tabId, generation, allowUnknownGeneration = false) {
+  const currentGeneration = badgeGenerations.get(tabId);
+  return currentGeneration === generation || (allowUnknownGeneration && currentGeneration === undefined);
+}
+
+function getBadgeAlarmName(tabId, generation) {
+  return `${BADGE_CLEAR_ALARM_PREFIX}${tabId}${BADGE_CLEAR_ALARM_SEPARATOR}${generation}`;
+}
+
+function getBadgeAlarmPayload(name) {
+  if (!name.startsWith(BADGE_CLEAR_ALARM_PREFIX)) {
+    return null;
+  }
+
+  const payload = name.slice(BADGE_CLEAR_ALARM_PREFIX.length);
+  const separatorIndex = payload.indexOf(BADGE_CLEAR_ALARM_SEPARATOR);
+  if (separatorIndex <= 0 || separatorIndex === payload.length - 1) {
+    return null;
+  }
+
+  const tabIdValue = payload.slice(0, separatorIndex);
+  const generation = payload.slice(separatorIndex + 1);
+  const tabId = Number(tabIdValue);
+  if (!Number.isInteger(tabId)) {
+    return null;
+  }
+
+  return { tabId, generation };
+}
+
+async function cancelBadgeClear(tabId, options = {}) {
+  const shouldContinue = () =>
+    !options.generation || canClearBadgeGeneration(tabId, options.generation, options.allowUnknownGeneration);
+
+  if (!shouldContinue()) {
+    return;
+  }
+
+  const timerId = badgeClearTimers.get(tabId);
+  if (timerId) {
+    clearTimeout(timerId);
+    badgeClearTimers.delete(tabId);
+  }
+
+  const alarmNames = new Set();
+  const alarmName = badgeClearAlarms.get(tabId);
+  if (alarmName) {
+    alarmNames.add(alarmName);
+  }
+  badgeClearAlarms.delete(tabId);
+
+  try {
+    const alarms = await chrome.alarms.getAll();
+    if (!shouldContinue()) {
+      return;
+    }
+
+    for (const alarm of alarms) {
+      const badgeAlarm = getBadgeAlarmPayload(alarm.name);
+      if (badgeAlarm && badgeAlarm.tabId === tabId) {
+        alarmNames.add(alarm.name);
+      }
+    }
+  } catch (error) {
+    console.debug('Frame of Reference: badge alarm lookup failed', error);
+  }
+
+  if (!shouldContinue()) {
+    return;
+  }
+
+  await Promise.all(
+    [...alarmNames].map(async (name) => {
+      if (!shouldContinue()) {
+        return;
+      }
+
+      try {
+        await chrome.alarms.clear(name);
+      } catch (error) {
+        console.debug('Frame of Reference: badge alarm clear failed', error);
+      }
+    })
+  );
+}
+
+async function scheduleBadgeClear(tabId, durationMs, generation) {
+  if (!isBadgeGenerationCurrent(tabId, generation)) {
+    return;
+  }
+
+  const timerId = setTimeout(() => {
+    if (!isBadgeGenerationCurrent(tabId, generation)) {
+      return;
+    }
+
+    badgeClearTimers.delete(tabId);
+    dispatchBestEffort(clearBadgeForGeneration(tabId, generation));
+  }, durationMs);
+  const alarmName = getBadgeAlarmName(tabId, generation);
+
+  badgeClearTimers.set(tabId, timerId);
+  badgeClearAlarms.set(tabId, alarmName);
+  await chrome.alarms.create(alarmName, {
+    when: Date.now() + durationMs + BADGE_CLEAR_ALARM_GRACE_MS
+  });
 }

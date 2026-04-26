@@ -208,6 +208,9 @@
     MIN_RIGHT_CLEARANCE: 80,
     CENTER_OFFSET: 32
   };
+  const COPY_FEEDBACK_DELAY_MS = 600;
+  const TOAST_FADE_DELAY_MS = 400;
+  const NO_TARGET_TOAST_FADE_DELAY_MS = 900;
 
   // --- Exact Selector Scoring Weights ---
   const SELECTOR_SCORING = {
@@ -314,10 +317,12 @@
       this._feedbackTimerId = 0;
       this._feedbackResolve = null;
       this._copyInFlight = false;
+      this._copyGeneration = 0;
       this._listenersAttached = false;
 
       this.handlePointerMove = this.handlePointerMove.bind(this);
       this.handlePointerDown = this.handlePointerDown.bind(this);
+      this.handlePointerUp = this.handlePointerUp.bind(this);
       this.handleClick = this.handleClick.bind(this);
       this.handleKeydown = this.handleKeydown.bind(this);
       this.handleViewportChange = this.handleViewportChange.bind(this);
@@ -344,6 +349,7 @@
       this.pendingPointer = null;
       this.refinementLocked = false;
       this._copyInFlight = false;
+      this._copyGeneration += 1;
     }
 
     activate() {
@@ -395,6 +401,7 @@
       this._listenersAttached = true;
       document.addEventListener('pointermove', this.handlePointerMove, true);
       document.addEventListener('pointerdown', this.handlePointerDown, true);
+      document.addEventListener('pointerup', this.handlePointerUp, true);
       document.addEventListener('click', this.handleClick, true);
       document.addEventListener('keydown', this.handleKeydown, true);
       window.addEventListener('scroll', this.handleViewportChange, { capture: true, passive: true });
@@ -408,6 +415,7 @@
       this._listenersAttached = false;
       document.removeEventListener('pointermove', this.handlePointerMove, true);
       document.removeEventListener('pointerdown', this.handlePointerDown, true);
+      document.removeEventListener('pointerup', this.handlePointerUp, true);
       document.removeEventListener('click', this.handleClick, true);
       document.removeEventListener('keydown', this.handleKeydown, true);
       window.removeEventListener('scroll', this.handleViewportChange, { capture: true, passive: true });
@@ -613,6 +621,14 @@
       this.suppressEvent(event);
     }
 
+    handlePointerUp(event) {
+      if (!this.active || event.button !== 0) {
+        return;
+      }
+
+      this.suppressEvent(event);
+    }
+
     async handleClick(event) {
       if (!this.active || event.button !== 0) {
         return;
@@ -638,6 +654,7 @@
 
         const primaryTarget = this.currentTarget || resolution.primaryTarget;
         if (!primaryTarget) {
+          this.showCenteredToast('Hover an element first');
           return;
         }
 
@@ -677,6 +694,11 @@
       if (event.key === 'Enter') {
         this.suppressEvent(event);
 
+        if (!this.currentTarget) {
+          this.showCenteredToast('Hover an element first');
+          return;
+        }
+
         void this.copyCurrentTarget();
       }
     }
@@ -715,12 +737,14 @@
       this._originalReplaceState = history.replaceState;
       const self = this;
       history.pushState = function (...args) {
-        self._originalPushState.apply(this, args);
+        const result = self._originalPushState.apply(history, args);
         self.handleNavigation();
+        return result;
       };
       history.replaceState = function (...args) {
-        self._originalReplaceState.apply(this, args);
+        const result = self._originalReplaceState.apply(history, args);
         self.handleNavigation();
+        return result;
       };
     }
 
@@ -885,8 +909,19 @@
             continue;
           }
 
-          if (element.shadowRoot) {
-            visitRoot(element.shadowRoot);
+          let shadowRoot = null;
+          try {
+            shadowRoot = element.shadowRoot;
+          } catch (error) {
+            console.debug('Frame of Reference: shadow root lookup failed', error);
+          }
+
+          if (shadowRoot) {
+            try {
+              visitRoot(shadowRoot);
+            } catch (error) {
+              console.debug('Frame of Reference: shadow root traversal failed', error);
+            }
           }
 
           addSelectable(element);
@@ -903,13 +938,17 @@
         return [];
       }
 
-      if (typeof root.elementsFromPoint === 'function') {
-        return root.elementsFromPoint(clientX, clientY);
-      }
+      try {
+        if (typeof root.elementsFromPoint === 'function') {
+          return root.elementsFromPoint(clientX, clientY);
+        }
 
-      if (typeof root.elementFromPoint === 'function') {
-        const element = root.elementFromPoint(clientX, clientY);
-        return element ? [element] : [];
+        if (typeof root.elementFromPoint === 'function') {
+          const element = root.elementFromPoint(clientX, clientY);
+          return element ? [element] : [];
+        }
+      } catch (error) {
+        console.debug('Frame of Reference: elementsFromPoint failed', error);
       }
 
       return [];
@@ -1153,6 +1192,7 @@
       }
 
       this._copyInFlight = true;
+      const copyGeneration = this._copyGeneration;
 
       try {
         const capture = this.buildCapture(target);
@@ -1161,16 +1201,26 @@
         // Attempt dual clipboard write: text + cropped screenshot.
         // This is best-effort — any failure silently falls back to text-only.
         const imageBlob = await this.captureElementScreenshot(target);
+        if (!this.isCopyOperationCurrent(copyGeneration)) {
+          return;
+        }
+
         if (imageBlob) {
           copiedWithScreenshot = await this.copyTextAndImage(capture.clipboardText, imageBlob);
+          if (!this.isCopyOperationCurrent(copyGeneration)) {
+            return;
+          }
         }
 
         // Fall back to text-only if screenshot was unavailable or dual write failed.
         if (!copiedWithScreenshot) {
           const copied = await this.copyText(capture.clipboardText);
+          if (!this.isCopyOperationCurrent(copyGeneration)) {
+            return;
+          }
+
           if (!copied) {
-            this.deactivate();
-            this.notifyResult('error');
+            this.failCopyOperation(copyGeneration);
             return;
           }
         }
@@ -1182,15 +1232,39 @@
         // stored so deactivate() can cancel it if the user navigates away.
         await new Promise((resolve) => {
           this._feedbackResolve = resolve;
-          this._feedbackTimerId = setTimeout(resolve, 600);
+          this._feedbackTimerId = setTimeout(resolve, COPY_FEEDBACK_DELAY_MS);
         });
+        this._feedbackTimerId = 0;
         this._feedbackResolve = null;
+        if (!this.isCopyOperationCurrent(copyGeneration)) {
+          return;
+        }
 
+        this._copyInFlight = false;
         this.deactivate();
         this.notifyResult('copied');
+      } catch (error) {
+        console.debug('Frame of Reference: copy failed', error);
+        this.failCopyOperation(copyGeneration);
       } finally {
-        this._copyInFlight = false;
+        if (this._copyGeneration === copyGeneration) {
+          this._copyInFlight = false;
+        }
       }
+    }
+
+    isCopyOperationCurrent(copyGeneration) {
+      return this.active && this._copyGeneration === copyGeneration;
+    }
+
+    failCopyOperation(copyGeneration) {
+      if (!this.isCopyOperationCurrent(copyGeneration)) {
+        return;
+      }
+
+      this._copyInFlight = false;
+      this.deactivate();
+      this.notifyResult('error');
     }
 
     resolveEventTarget(event) {
@@ -1461,6 +1535,21 @@
       this.outline.style.borderColor = '#22c55e';
     }
 
+    clearToastTimer() {
+      clearTimeout(this._toastTimerId);
+      this._toastTimerId = 0;
+    }
+
+    scheduleToastFade(delayMs) {
+      this.clearToastTimer();
+      this._toastTimerId = setTimeout(() => {
+        if (this.toast) {
+          this.toast.style.opacity = '0';
+        }
+        this._toastTimerId = 0;
+      }, delayMs);
+    }
+
     showToast(targetElement, message = 'Copied!') {
       if (!this.toast || !this.outline) {
         return;
@@ -1487,24 +1576,36 @@
 
       this.toast.style.top = `${toastTop}px`;
       this.toast.style.left = `${toastLeft}px`;
+      this.toast.style.transform = 'none';
       this.toast.style.display = 'block';
       this.toast.style.opacity = '1';
 
-      this._toastTimerId = setTimeout(() => {
-        if (this.toast) {
-          this.toast.style.opacity = '0';
-        }
-      }, 400);
+      this.scheduleToastFade(TOAST_FADE_DELAY_MS);
+    }
+
+    showCenteredToast(message) {
+      if (!this.toast) {
+        return;
+      }
+
+      this.toast.textContent = message;
+      this.toast.style.top = `${TOAST_LAYOUT.OFFSET_Y}px`;
+      this.toast.style.left = '50%';
+      this.toast.style.transform = 'translateX(-50%)';
+      this.toast.style.display = 'block';
+      this.toast.style.opacity = '1';
+
+      this.scheduleToastFade(NO_TARGET_TOAST_FADE_DELAY_MS);
     }
 
     hideToast() {
       if (!this.toast) {
         return;
       }
-      clearTimeout(this._toastTimerId);
-      this._toastTimerId = 0;
+      this.clearToastTimer();
       this.toast.style.display = 'none';
       this.toast.style.opacity = '0';
+      this.toast.style.transform = 'none';
 
       // Reset outline color for next activation.
       if (this.outline) {
@@ -3082,6 +3183,7 @@
     // Elements larger than 50% of the viewport are skipped since they provide
     // limited visual value at high memory cost.
     static SCREENSHOT_MAX_VIEWPORT_FRACTION = 0.5;
+    static CAPTURE_RESPONSE_TIMEOUT_MS = 3000;
 
     // Captures a cropped screenshot of the target element's bounding rect.
     // The entire flow is in-memory: captureVisibleTab returns a data URL string,
@@ -3112,6 +3214,7 @@
         // try/finally ensures the overlay is always restored, regardless of
         // whether the rAF, sendMessage, or cropScreenshot steps throw or reject.
         let response;
+        const previousDisplay = this.overlayRoot ? this.overlayRoot.style.display : '';
         try {
           if (this.overlayRoot) {
             this.overlayRoot.style.display = 'none';
@@ -3120,19 +3223,13 @@
           // Wait one frame for the paint to flush before capturing.
           await new Promise((resolve) => requestAnimationFrame(resolve));
 
-          response = await new Promise((resolve) => {
-            try {
-              chrome.runtime.sendMessage({ type: 'frameofreference:capture' }, (resp) => {
-                void chrome.runtime.lastError;
-                resolve(resp);
-              });
-            } catch (_error) {
-              resolve(null);
-            }
-          });
+          response = await this.sendRuntimeMessageForResponse(
+            { type: 'frameofreference:capture' },
+            FrameOfReferencePicker.CAPTURE_RESPONSE_TIMEOUT_MS
+          );
         } finally {
           if (this.overlayRoot) {
-            this.overlayRoot.style.display = 'block';
+            this.overlayRoot.style.display = previousDisplay;
           }
         }
 
@@ -3287,6 +3384,47 @@
           console.debug('Frame of Reference: sendRuntimeMessage failed', error);
         }
       }
+    }
+
+    sendRuntimeMessageForResponse(message, timeoutMs) {
+      return new Promise((resolve) => {
+        let settled = false;
+        let timeoutId = 0;
+        const settle = (value) => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve(value);
+        };
+
+        timeoutId = setTimeout(() => settle(null), timeoutMs);
+
+        try {
+          chrome.runtime.sendMessage(message, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              if (
+                typeof runtimeError.message === 'string' &&
+                !runtimeError.message.includes('Extension context invalidated')
+              ) {
+                console.debug('Frame of Reference: runtime message failed', runtimeError.message);
+              }
+              settle(null);
+              return;
+            }
+
+            settle(response || null);
+          });
+        } catch (error) {
+          if (typeof error?.message === 'string' && !error.message.includes('Extension context invalidated')) {
+            console.debug('Frame of Reference: runtime message failed', error);
+          }
+          settle(null);
+        }
+      });
     }
   }
 
