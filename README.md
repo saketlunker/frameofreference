@@ -20,6 +20,8 @@ Region: search "Query input" (parent container)
 
 Each line serves a purpose: `Path` gives page context, `Target` describes what you selected, `Exact` is a precise CSS pinpoint, and `Region` shows the surrounding container. A `Locator` fallback only appears when the CSS selector is too complex.
 
+When supported by Chrome and the paste target, the clipboard also includes a cropped screenshot of the selected element alongside the text reference. If rich clipboard image copy is unavailable, the extension preserves the text-only copy path.
+
 ## Install
 
 1. Open `chrome://extensions`

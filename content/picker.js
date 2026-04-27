@@ -1226,7 +1226,7 @@
         }
 
         this.flashOutlineSuccess();
-        this.showToast(target, copiedWithScreenshot ? 'Copied with screenshot!' : 'Copied!');
+        this.showToast(target, copiedWithScreenshot ? 'Copied text + screenshot!' : 'Copied!');
 
         // Allow brief visual feedback before deactivating. The timer ID is
         // stored so deactivate() can cancel it if the user navigates away.
@@ -3177,6 +3177,15 @@
         .replace(/"/g, '\\"');
     }
 
+    escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     // --- Screenshot Capture ---
 
     // Maximum element area (as fraction of viewport) for screenshot capture.
@@ -3293,17 +3302,29 @@
       });
     }
 
-    // Writes both text and an image to the clipboard in a single ClipboardItem.
-    // Returns true on success. Falls back gracefully — the caller should use
-    // copyText() if this returns false.
+    // Writes text and image representations in one clipboard item. The HTML
+    // representation gives rich paste targets visible text plus the screenshot;
+    // text/plain preserves plain-text paste. Return false so the caller can
+    // preserve the core text-only copy if this richer write is unavailable.
     async copyTextAndImage(text, imageBlob) {
-      if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function') {
+      if (
+        !navigator.clipboard ||
+        typeof navigator.clipboard.write !== 'function' ||
+        typeof ClipboardItem !== 'function'
+      ) {
+        return false;
+      }
+
+      if (typeof ClipboardItem.supports === 'function' && !ClipboardItem.supports('image/png')) {
         return false;
       }
 
       try {
+        const imageDataUrl = await this.blobToDataUrl(imageBlob);
         const textBlob = new Blob([text], { type: 'text/plain' });
+        const htmlBlob = new Blob([this.buildClipboardHtml(text, imageDataUrl)], { type: 'text/html' });
         const item = new ClipboardItem({
+          'text/html': htmlBlob,
           'text/plain': textBlob,
           'image/png': imageBlob
         });
@@ -3313,6 +3334,32 @@
         console.debug('Frame of Reference: dual clipboard write failed', error);
         return false;
       }
+    }
+
+    blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (typeof reader.result === 'string') {
+            resolve(reader.result);
+            return;
+          }
+
+          reject(new Error('Unexpected clipboard image data.'));
+        };
+        reader.onerror = () => reject(reader.error || new Error('Unable to encode clipboard image.'));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    buildClipboardHtml(text, imageDataUrl) {
+      return [
+        '<meta charset="utf-8">',
+        '<div data-frameofreference-clipboard="true">',
+        `<pre>${this.escapeHtml(text)}</pre>`,
+        `<img src="${this.escapeHtml(imageDataUrl)}" alt="Selected UI element screenshot">`,
+        '</div>'
+      ].join('');
     }
 
     // --- Clipboard ---
